@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strings"
 
 	"github.com/charmbracelet/bubbles/list"
 	"github.com/charmbracelet/bubbles/textarea"
@@ -15,7 +16,7 @@ import (
 var (
 	valutDir string
 
-	blue      = lipgloss.Color("#3B82F6") // Tailwind Blue-500
+	blue      = lipgloss.Color("#3B82F6")
 	blueLight = lipgloss.Color("#60A5FA")
 	textWhite = lipgloss.Color("#FFFFFF")
 
@@ -65,6 +66,7 @@ type model struct {
 	newFileInput           textinput.Model
 	createFileInputVisible bool
 	currentFile            *os.File
+	currentFilePath        string
 	noteTextArea           textarea.Model
 	list                   list.Model
 	showingList            bool
@@ -81,7 +83,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	switch msg := msg.(type) {
 
-	// Responsive window resize
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
@@ -94,18 +95,24 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyMsg:
-
 		switch msg.String() {
 
 		case "ctrl+c", "q":
+			if m.currentFile != nil {
+				m.currentFile.Close()
+			}
 			return m, tea.Quit
 
 		case "ctrl+n":
 			m.createFileInputVisible = true
 			m.showingList = false
-			return m, nil
+			m.newFileInput.Focus()
+			return m, m.newFileInput.Focus()
 
 		case "ctrl+l":
+			// Refresh file list
+			items := listFiles()
+			m.list.SetItems(items)
 			m.showingList = true
 			m.createFileInputVisible = false
 			return m, nil
@@ -114,6 +121,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.createFileInputVisible {
 				m.createFileInputVisible = false
 				m.newFileInput.SetValue("")
+				m.newFileInput.Blur()
 				return m, nil
 			}
 
@@ -125,7 +133,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.currentFile != nil {
 				m.currentFile.Close()
 				m.currentFile = nil
+				m.currentFilePath = ""
 				m.noteTextArea.SetValue("")
+				m.noteTextArea.Blur()
 				return m, nil
 			}
 
@@ -136,57 +146,96 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				break
 			}
 
-			m.currentFile.Truncate(0)
-			m.currentFile.Seek(0, 0)
-			m.currentFile.WriteString(m.noteTextArea.Value())
-			m.currentFile.Close()
+			// Write to file
+			if err := m.currentFile.Truncate(0); err != nil {
+				log.Printf("Error truncating file: %v", err)
+				break
+			}
+			if _, err := m.currentFile.Seek(0, 0); err != nil {
+				log.Printf("Error seeking file: %v", err)
+				break
+			}
+			if _, err := m.currentFile.WriteString(m.noteTextArea.Value()); err != nil {
+				log.Printf("Error writing file: %v", err)
+				break
+			}
+			if err := m.currentFile.Sync(); err != nil {
+				log.Printf("Error syncing file: %v", err)
+			}
 
-			m.currentFile = nil
-			m.noteTextArea.SetValue("")
 			return m, nil
 
 		case "enter":
 			if m.showingList {
-				item, ok := m.list.SelectedItem().(item)
+				selectedItem, ok := m.list.SelectedItem().(item)
 				if ok {
-					filepath := fmt.Sprintf("%s/%s", valutDir, item.title[2:])
-					content, _ := os.ReadFile(filepath)
+					// Remove emoji prefix to get actual filename
+					filename := strings.TrimPrefix(selectedItem.title, "📘 ")
+					filepath := fmt.Sprintf("%s/%s", valutDir, filename)
+
+					content, err := os.ReadFile(filepath)
+					if err != nil {
+						log.Printf("Error reading file: %v", err)
+						return m, nil
+					}
+
+					f, err := os.OpenFile(filepath, os.O_RDWR, 0644)
+					if err != nil {
+						log.Printf("Error opening file: %v", err)
+						return m, nil
+					}
 
 					m.noteTextArea.SetValue(string(content))
-					f, _ := os.OpenFile(filepath, os.O_RDWR, 0644)
+					m.noteTextArea.Focus()
 					m.currentFile = f
+					m.currentFilePath = filepath
 					m.showingList = false
 				}
-				return m, nil
+				return m, m.noteTextArea.Focus()
 			}
 
 			if m.createFileInputVisible {
-				filename := m.newFileInput.Value()
+				filename := strings.TrimSpace(m.newFileInput.Value())
 
 				if filename != "" {
-					filepath := fmt.Sprintf("%s/%s.md", valutDir, filename)
+					// Add .md extension if not present
+					if !strings.HasSuffix(filename, ".md") {
+						filename = filename + ".md"
+					}
+
+					filepath := fmt.Sprintf("%s/%s", valutDir, filename)
 					f, err := os.Create(filepath)
 					if err != nil {
-						log.Fatalf("%v", err)
+						log.Printf("Error creating file: %v", err)
+						return m, nil
 					}
+
 					m.currentFile = f
+					m.currentFilePath = filepath
 					m.createFileInputVisible = false
 					m.newFileInput.SetValue("")
+					m.newFileInput.Blur()
+					m.noteTextArea.Focus()
+
+					return m, m.noteTextArea.Focus()
 				}
 				return m, nil
 			}
 		}
 	}
 
-	// Route events
+	// Route events to appropriate components
 	if m.createFileInputVisible {
 		m.newFileInput, cmd = m.newFileInput.Update(msg)
+		return m, cmd
 	}
-	if m.currentFile != nil {
+	if m.currentFile != nil && !m.showingList {
 		m.noteTextArea, cmd = m.noteTextArea.Update(msg)
+		return m, cmd
 	}
 	if m.showingList {
 		m.list, cmd = m.list.Update(msg)
+		return m, cmd
 	}
 
 	return m, cmd
@@ -195,7 +244,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // ---------------- View ----------------
 
 func (m model) View() string {
-
 	header := titleStyle.Render("🔷 Totion — Minimal Note Vault 🧠")
 
 	help := helpStyle.Render("🆕 New: Ctrl+N · 📂 List: Ctrl+L · 💾 Save: Ctrl+S · ❌ Quit: Q · ESC: Back")
@@ -206,16 +254,27 @@ func (m model) View() string {
 
 	switch {
 	case m.createFileInputVisible:
-		view = mainContainer.Render(m.newFileInput.View())
+		prompt := "Enter note name:\n\n"
+		view = mainContainer.Render(prompt + m.newFileInput.View())
 
 	case m.currentFile != nil:
-		view = mainContainer.Render(m.noteTextArea.View())
+		filename := ""
+		if m.currentFilePath != "" {
+			parts := strings.Split(m.currentFilePath, "/")
+			filename = parts[len(parts)-1]
+		}
+		noteView := fmt.Sprintf("Editing: %s\n\n%s", filename, m.noteTextArea.View())
+		view = mainContainer.Render(noteView)
 
 	case m.showingList:
 		view = mainContainer.Render(m.list.View())
 
 	default:
-		view = mainContainer.Render("Press Ctrl+N to create a note or Ctrl+L to view notes.")
+		welcome := "Welcome to Totion! 📝\n\n" +
+			"Press Ctrl+N to create a new note\n" +
+			"Press Ctrl+L to view your notes\n" +
+			"Press Q to quit"
+		view = mainContainer.Render(welcome)
 	}
 
 	return lipgloss.JoinVertical(lipgloss.Left, header, view, help)
@@ -224,7 +283,9 @@ func (m model) View() string {
 // ---------------- Init Model ----------------
 
 func initialModel() model {
-	os.MkdirAll(valutDir, 0750)
+	if err := os.MkdirAll(valutDir, 0750); err != nil {
+		log.Fatalf("Error creating vault directory: %v", err)
+	}
 
 	ti := textinput.New()
 	ti.Placeholder = "Name your note..."
@@ -235,8 +296,8 @@ func initialModel() model {
 	ti.TextStyle = cursorStyle
 
 	ta := textarea.New()
-	ta.Placeholder = "Start writing..."
-	ta.Focus()
+	ta.Placeholder = "Start writing your note..."
+	ta.ShowLineNumbers = false
 
 	items := listFiles()
 	l := list.New(items, list.NewDefaultDelegate(), 40, 20)
@@ -262,11 +323,18 @@ func main() {
 
 func listFiles() []list.Item {
 	items := make([]list.Item, 0)
-	entries, _ := os.ReadDir(valutDir)
+	entries, err := os.ReadDir(valutDir)
+	if err != nil {
+		log.Printf("Error reading vault directory: %v", err)
+		return items
+	}
 
 	for _, ent := range entries {
-		if !ent.IsDir() {
-			info, _ := ent.Info()
+		if !ent.IsDir() && strings.HasSuffix(ent.Name(), ".md") {
+			info, err := ent.Info()
+			if err != nil {
+				continue
+			}
 			mod := info.ModTime().Format("02 Jan 06 15:04")
 
 			items = append(items, item{
