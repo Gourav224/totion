@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/list"
@@ -13,335 +15,375 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
+const noteExtension = ".md"
+
 var (
-	valutDir string
+	vaultDir string
 
-	blue      = lipgloss.Color("#3B82F6")
-	blueLight = lipgloss.Color("#60A5FA")
-	textWhite = lipgloss.Color("#FFFFFF")
-
-	titleStyle = lipgloss.NewStyle().
-			Bold(true).
-			Foreground(textWhite).
-			Background(blue).
-			Padding(0, 2).
-			MarginBottom(1)
-
-	helpStyle = lipgloss.NewStyle().
-			Foreground(blueLight).
-			MarginTop(1)
-
-	containerStyle = lipgloss.NewStyle().
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(blue).
-			Padding(1, 2)
-
-	cursorStyle = lipgloss.NewStyle().
-			Foreground(blueLight)
+	ink         = lipgloss.Color("#111827")
+	muted       = lipgloss.Color("#6B7280")
+	blue        = lipgloss.Color("#2563EB")
+	green       = lipgloss.Color("#059669")
+	red         = lipgloss.Color("#DC2626")
+	border      = lipgloss.Color("#D1D5DB")
+	white       = lipgloss.Color("#FFFFFF")
+	titleStyle  = lipgloss.NewStyle().Bold(true).Foreground(white).Background(blue).Padding(0, 2).MarginBottom(1)
+	helpStyle   = lipgloss.NewStyle().Foreground(muted).MarginTop(1)
+	panelStyle  = lipgloss.NewStyle().Border(lipgloss.NormalBorder()).BorderForeground(border).Padding(1, 2)
+	labelStyle  = lipgloss.NewStyle().Bold(true).Foreground(ink)
+	statusStyle = lipgloss.NewStyle().Foreground(green).MarginTop(1)
+	errorStyle  = lipgloss.NewStyle().Foreground(red).MarginTop(1)
+	cursorStyle = lipgloss.NewStyle().Foreground(blue)
 )
 
 func init() {
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
-		log.Fatal("Error getting home directory", err)
+		log.Fatal("get home directory:", err)
 	}
-	valutDir = fmt.Sprintf("%s/.totion", homeDir)
+	vaultDir = filepath.Join(homeDir, ".totion")
 }
 
-// ---------------- Items ----------------
-
-type item struct {
-	title, desc string
+type noteItem struct {
+	filename string
+	modified string
+	modTime  int64
 }
 
-func (i item) Title() string       { return "📘 " + i.title }
-func (i item) FilterValue() string { return i.title }
-func (i item) Description() string { return i.desc }
+func (n noteItem) Title() string       { return n.filename }
+func (n noteItem) FilterValue() string { return n.filename }
+func (n noteItem) Description() string { return "Updated " + n.modified }
 
-// ---------------- Model ----------------
+type appModel struct {
+	width  int
+	height int
 
-type model struct {
-	width, height int
-
-	newFileInput           textinput.Model
-	createFileInputVisible bool
-	currentFile            *os.File
-	currentFilePath        string
-	noteTextArea           textarea.Model
-	list                   list.Model
-	showingList            bool
+	newNoteInput       textinput.Model
+	newNoteInputActive bool
+	noteTextArea       textarea.Model
+	noteList           list.Model
+	noteListActive     bool
+	activeNotePath     string
+	statusMessage      string
+	errorMessage       string
 }
 
-func (m model) Init() tea.Cmd {
+func (m appModel) Init() tea.Cmd {
 	return tea.EnterAltScreen
 }
 
-// ---------------- Update ----------------
-
-func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+func (m appModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 
 	switch msg := msg.(type) {
-
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+		contentWidth := max(20, msg.Width-8)
+		contentHeight := max(8, msg.Height-12)
 
-		m.list.SetSize(msg.Width-8, msg.Height-12)
-		m.noteTextArea.SetWidth(msg.Width - 8)
-		m.noteTextArea.SetHeight(msg.Height - 12)
-		m.newFileInput.Width = msg.Width - 10
+		m.noteList.SetSize(contentWidth, contentHeight)
+		m.noteTextArea.SetWidth(contentWidth)
+		m.noteTextArea.SetHeight(contentHeight)
+		m.newNoteInput.Width = max(20, msg.Width-12)
 
 		return m, nil
 
 	case tea.KeyMsg:
 		switch msg.String() {
-
 		case "ctrl+c", "q":
-			if m.currentFile != nil {
-				m.currentFile.Close()
-			}
 			return m, tea.Quit
 
 		case "ctrl+n":
-			m.createFileInputVisible = true
-			m.showingList = false
-			m.newFileInput.Focus()
-			return m, m.newFileInput.Focus()
+			m.clearMessages()
+			m.newNoteInputActive = true
+			m.noteListActive = false
+			m.newNoteInput.Focus()
+			return m, m.newNoteInput.Focus()
 
 		case "ctrl+l":
-			// Refresh file list
-			items := listFiles()
-			m.list.SetItems(items)
-			m.showingList = true
-			m.createFileInputVisible = false
+			m.clearMessages()
+			m.refreshNoteList()
+			m.noteListActive = true
+			m.newNoteInputActive = false
+			m.noteTextArea.Blur()
 			return m, nil
 
 		case "esc":
-			if m.createFileInputVisible {
-				m.createFileInputVisible = false
-				m.newFileInput.SetValue("")
-				m.newFileInput.Blur()
+			m.clearMessages()
+			if m.newNoteInputActive {
+				m.newNoteInputActive = false
+				m.newNoteInput.SetValue("")
+				m.newNoteInput.Blur()
 				return m, nil
 			}
 
-			if m.showingList {
-				m.showingList = false
+			if m.noteListActive {
+				m.noteListActive = false
+				if m.activeNotePath != "" {
+					m.noteTextArea.Focus()
+					return m, m.noteTextArea.Focus()
+				}
 				return m, nil
 			}
 
-			if m.currentFile != nil {
-				m.currentFile.Close()
-				m.currentFile = nil
-				m.currentFilePath = ""
+			if m.activeNotePath != "" {
+				m.activeNotePath = ""
 				m.noteTextArea.SetValue("")
 				m.noteTextArea.Blur()
-				return m, nil
 			}
 
 			return m, nil
 
 		case "ctrl+s":
-			if m.currentFile == nil {
-				break
+			if m.activeNotePath == "" {
+				m.setError("Open or create a note before saving.")
+				return m, nil
 			}
 
-			// Write to file
-			if err := m.currentFile.Truncate(0); err != nil {
-				log.Printf("Error truncating file: %v", err)
-				break
-			}
-			if _, err := m.currentFile.Seek(0, 0); err != nil {
-				log.Printf("Error seeking file: %v", err)
-				break
-			}
-			if _, err := m.currentFile.WriteString(m.noteTextArea.Value()); err != nil {
-				log.Printf("Error writing file: %v", err)
-				break
-			}
-			if err := m.currentFile.Sync(); err != nil {
-				log.Printf("Error syncing file: %v", err)
+			if err := os.WriteFile(m.activeNotePath, []byte(m.noteTextArea.Value()), 0600); err != nil {
+				m.setError(fmt.Sprintf("Could not save note: %v", err))
+				return m, nil
 			}
 
+			m.statusMessage = fmt.Sprintf("Saved %s", filepath.Base(m.activeNotePath))
+			m.errorMessage = ""
+			m.refreshNoteList()
 			return m, nil
 
 		case "enter":
-			if m.showingList {
-				selectedItem, ok := m.list.SelectedItem().(item)
-				if ok {
-					// Remove emoji prefix to get actual filename
-					filename := strings.TrimPrefix(selectedItem.title, "📘 ")
-					filepath := fmt.Sprintf("%s/%s", valutDir, filename)
-
-					content, err := os.ReadFile(filepath)
-					if err != nil {
-						log.Printf("Error reading file: %v", err)
-						return m, nil
-					}
-
-					f, err := os.OpenFile(filepath, os.O_RDWR, 0644)
-					if err != nil {
-						log.Printf("Error opening file: %v", err)
-						return m, nil
-					}
-
-					m.noteTextArea.SetValue(string(content))
-					m.noteTextArea.Focus()
-					m.currentFile = f
-					m.currentFilePath = filepath
-					m.showingList = false
+			if m.noteListActive {
+				selectedNote, ok := m.noteList.SelectedItem().(noteItem)
+				if !ok {
+					return m, nil
 				}
-				return m, m.noteTextArea.Focus()
+
+				return m.openNote(selectedNote.filename)
 			}
 
-			if m.createFileInputVisible {
-				filename := strings.TrimSpace(m.newFileInput.Value())
-
-				if filename != "" {
-					// Add .md extension if not present
-					if !strings.HasSuffix(filename, ".md") {
-						filename = filename + ".md"
-					}
-
-					filepath := fmt.Sprintf("%s/%s", valutDir, filename)
-					f, err := os.Create(filepath)
-					if err != nil {
-						log.Printf("Error creating file: %v", err)
-						return m, nil
-					}
-
-					m.currentFile = f
-					m.currentFilePath = filepath
-					m.createFileInputVisible = false
-					m.newFileInput.SetValue("")
-					m.newFileInput.Blur()
-					m.noteTextArea.Focus()
-
-					return m, m.noteTextArea.Focus()
-				}
-				return m, nil
+			if m.newNoteInputActive {
+				return m.createNote()
 			}
 		}
 	}
 
-	// Route events to appropriate components
-	if m.createFileInputVisible {
-		m.newFileInput, cmd = m.newFileInput.Update(msg)
+	if m.newNoteInputActive {
+		m.newNoteInput, cmd = m.newNoteInput.Update(msg)
 		return m, cmd
 	}
-	if m.currentFile != nil && !m.showingList {
+
+	if m.activeNotePath != "" && !m.noteListActive {
 		m.noteTextArea, cmd = m.noteTextArea.Update(msg)
 		return m, cmd
 	}
-	if m.showingList {
-		m.list, cmd = m.list.Update(msg)
+
+	if m.noteListActive {
+		m.noteList, cmd = m.noteList.Update(msg)
 		return m, cmd
 	}
 
 	return m, cmd
 }
 
-// ---------------- View ----------------
+func (m appModel) View() string {
+	header := titleStyle.Render("Totion - Markdown Note Vault")
+	help := helpStyle.Render("Ctrl+N New  Ctrl+L Notes  Ctrl+S Save  Esc Back  Q Quit")
 
-func (m model) View() string {
-	header := titleStyle.Render("🔷 Totion — Minimal Note Vault 🧠")
+	panelWidth := max(24, m.width-4)
+	panel := panelStyle.Width(panelWidth)
 
-	help := helpStyle.Render("🆕 New: Ctrl+N · 📂 List: Ctrl+L · 💾 Save: Ctrl+S · ❌ Quit: Q · ESC: Back")
-
-	mainContainer := containerStyle.Width(m.width - 4)
-
-	var view string
-
+	var body string
 	switch {
-	case m.createFileInputVisible:
-		prompt := "Enter note name:\n\n"
-		view = mainContainer.Render(prompt + m.newFileInput.View())
+	case m.newNoteInputActive:
+		body = panel.Render(labelStyle.Render("Create note") + "\n\n" + m.newNoteInput.View())
 
-	case m.currentFile != nil:
-		filename := ""
-		if m.currentFilePath != "" {
-			parts := strings.Split(m.currentFilePath, "/")
-			filename = parts[len(parts)-1]
-		}
-		noteView := fmt.Sprintf("Editing: %s\n\n%s", filename, m.noteTextArea.View())
-		view = mainContainer.Render(noteView)
+	case m.activeNotePath != "":
+		filename := filepath.Base(m.activeNotePath)
+		body = panel.Render(labelStyle.Render("Editing "+filename) + "\n\n" + m.noteTextArea.View())
 
-	case m.showingList:
-		view = mainContainer.Render(m.list.View())
+	case m.noteListActive:
+		body = panel.Render(m.noteList.View())
 
 	default:
-		welcome := "Welcome to Totion! 📝\n\n" +
-			"Press Ctrl+N to create a new note\n" +
-			"Press Ctrl+L to view your notes\n" +
-			"Press Q to quit"
-		view = mainContainer.Render(welcome)
+		body = panel.Render(
+			labelStyle.Render("No note open") + "\n\n" +
+				"Create a note with Ctrl+N or open your vault with Ctrl+L.\n" +
+				"Notes are saved as Markdown files in " + vaultDir + ".",
+		)
 	}
 
-	return lipgloss.JoinVertical(lipgloss.Left, header, view, help)
+	parts := []string{header, body}
+	if m.errorMessage != "" {
+		parts = append(parts, errorStyle.Render(m.errorMessage))
+	} else if m.statusMessage != "" {
+		parts = append(parts, statusStyle.Render(m.statusMessage))
+	}
+	parts = append(parts, help)
+
+	return lipgloss.JoinVertical(lipgloss.Left, parts...)
 }
 
-// ---------------- Init Model ----------------
-
-func initialModel() model {
-	if err := os.MkdirAll(valutDir, 0750); err != nil {
-		log.Fatalf("Error creating vault directory: %v", err)
+func initialModel() appModel {
+	if err := os.MkdirAll(vaultDir, 0750); err != nil {
+		log.Fatalf("create vault directory: %v", err)
 	}
 
-	ti := textinput.New()
-	ti.Placeholder = "Name your note..."
-	ti.CharLimit = 120
-	ti.Width = 50
-	ti.Cursor.Style = cursorStyle
-	ti.PromptStyle = cursorStyle
-	ti.TextStyle = cursorStyle
+	noteNameInput := textinput.New()
+	noteNameInput.Placeholder = "daily-plan"
+	noteNameInput.CharLimit = 120
+	noteNameInput.Width = 50
+	noteNameInput.Cursor.Style = cursorStyle
+	noteNameInput.PromptStyle = cursorStyle
+	noteNameInput.TextStyle = cursorStyle
 
-	ta := textarea.New()
-	ta.Placeholder = "Start writing your note..."
-	ta.ShowLineNumbers = false
+	editor := textarea.New()
+	editor.Placeholder = "Write your note..."
+	editor.ShowLineNumbers = false
 
-	items := listFiles()
-	l := list.New(items, list.NewDefaultDelegate(), 40, 20)
-	l.Title = "Your Notes"
-	l.Styles.Title = lipgloss.NewStyle().Bold(true).Foreground(blue)
+	noteList := list.New(listNotes(vaultDir), list.NewDefaultDelegate(), 40, 20)
+	noteList.Title = "Notes"
+	noteList.SetShowStatusBar(false)
+	noteList.SetFilteringEnabled(true)
+	noteList.Styles.Title = lipgloss.NewStyle().Bold(true).Foreground(blue)
+	noteList.Styles.PaginationStyle = lipgloss.NewStyle().Foreground(muted)
+	noteList.Styles.HelpStyle = lipgloss.NewStyle().Foreground(muted)
 
-	return model{
-		newFileInput: ti,
-		noteTextArea: ta,
-		list:         l,
+	return appModel{
+		newNoteInput:  noteNameInput,
+		noteTextArea:  editor,
+		noteList:      noteList,
+		statusMessage: "Vault ready at " + vaultDir,
 	}
 }
 
 func main() {
-	p := tea.NewProgram(initialModel(), tea.WithAltScreen())
-	if _, err := p.Run(); err != nil {
+	program := tea.NewProgram(initialModel(), tea.WithAltScreen())
+	if _, err := program.Run(); err != nil {
 		fmt.Println("Error:", err)
 		os.Exit(1)
 	}
 }
 
-// ---------------- List Files ----------------
-
-func listFiles() []list.Item {
-	items := make([]list.Item, 0)
-	entries, err := os.ReadDir(valutDir)
+func (m *appModel) openNote(filename string) (tea.Model, tea.Cmd) {
+	notePath := filepath.Join(vaultDir, filepath.Base(filename))
+	content, err := os.ReadFile(notePath)
 	if err != nil {
-		log.Printf("Error reading vault directory: %v", err)
-		return items
+		m.setError(fmt.Sprintf("Could not open note: %v", err))
+		return *m, nil
 	}
 
-	for _, ent := range entries {
-		if !ent.IsDir() && strings.HasSuffix(ent.Name(), ".md") {
-			info, err := ent.Info()
-			if err != nil {
-				continue
-			}
-			mod := info.ModTime().Format("02 Jan 06 15:04")
+	m.noteTextArea.SetValue(string(content))
+	m.noteTextArea.Focus()
+	m.activeNotePath = notePath
+	m.noteListActive = false
+	m.newNoteInputActive = false
+	m.statusMessage = "Opened " + filepath.Base(notePath)
+	m.errorMessage = ""
 
-			items = append(items, item{
-				title: ent.Name(),
-				desc:  fmt.Sprintf("Updated: %s", mod),
-			})
+	return *m, m.noteTextArea.Focus()
+}
+
+func (m *appModel) createNote() (tea.Model, tea.Cmd) {
+	filename := normalizeNoteFilename(m.newNoteInput.Value())
+	if filename == "" {
+		m.setError("Enter a note name.")
+		return *m, nil
+	}
+
+	notePath := filepath.Join(vaultDir, filename)
+	file, err := os.OpenFile(notePath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if err != nil {
+		m.setError(fmt.Sprintf("Could not create note: %v", err))
+		return *m, nil
+	}
+	if err := file.Close(); err != nil {
+		m.setError(fmt.Sprintf("Could not close note: %v", err))
+		return *m, nil
+	}
+
+	m.activeNotePath = notePath
+	m.noteTextArea.SetValue("")
+	m.noteTextArea.Focus()
+	m.newNoteInputActive = false
+	m.newNoteInput.SetValue("")
+	m.newNoteInput.Blur()
+	m.statusMessage = "Created " + filename
+	m.errorMessage = ""
+	m.refreshNoteList()
+
+	return *m, m.noteTextArea.Focus()
+}
+
+func (m *appModel) refreshNoteList() {
+	m.noteList.SetItems(listNotes(vaultDir))
+}
+
+func (m *appModel) clearMessages() {
+	m.statusMessage = ""
+	m.errorMessage = ""
+}
+
+func (m *appModel) setError(message string) {
+	m.errorMessage = message
+	m.statusMessage = ""
+}
+
+func normalizeNoteFilename(value string) string {
+	filename := strings.TrimSpace(value)
+	if filename == "" {
+		return ""
+	}
+
+	filename = filepath.Base(filename)
+	if filename == "." || filename == string(filepath.Separator) {
+		return ""
+	}
+
+	if !strings.HasSuffix(strings.ToLower(filename), noteExtension) {
+		filename += noteExtension
+	}
+
+	return filename
+}
+
+func listNotes(directory string) []list.Item {
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		log.Printf("read vault directory: %v", err)
+		return nil
+	}
+
+	notes := make([]noteItem, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(strings.ToLower(entry.Name()), noteExtension) {
+			continue
 		}
+
+		info, err := entry.Info()
+		if err != nil {
+			log.Printf("read note metadata for %s: %v", entry.Name(), err)
+			continue
+		}
+
+		notes = append(notes, noteItem{
+			filename: entry.Name(),
+			modified: info.ModTime().
+				Format("02 Jan 2006, 15:04"),
+			modTime: info.ModTime().UnixNano(),
+		})
 	}
+
+	sort.Slice(notes, func(i, j int) bool {
+		if notes[i].modTime == notes[j].modTime {
+			return notes[i].filename < notes[j].filename
+		}
+		return notes[i].modTime > notes[j].modTime
+	})
+
+	items := make([]list.Item, len(notes))
+	for i, note := range notes {
+		items[i] = note
+	}
+
 	return items
 }
